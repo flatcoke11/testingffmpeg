@@ -1,27 +1,73 @@
 const express = require('express');
-const { exec } = require('child_process');
+const cors = require('cors');
+const ffmpeg = require('fluent-ffmpeg');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// A simple endpoint to check if the service is up
+// Use CORS - This allows other websites to make requests to your API
+app.use(cors());
+
+// --- Your existing endpoints ---
 app.get('/', (req, res) => {
-  res.send('FFmpeg service is running. Use /ffmpeg-version to check.');
+  res.send('Welcome! Use /extract-audio?url=VIDEO_URL to extract audio.');
 });
 
-// Endpoint to verify FFmpeg installation
 app.get('/ffmpeg-version', (req, res) => {
-  // Execute the ffmpeg -version command
-  exec('ffmpeg -version', (error, stdout, stderr) => {
-    if (error) {
-      console.error(`exec error: ${error}`);
-      return res.status(500).send(`FFmpeg not found or error executing command: ${error.message}`);
+  ffmpeg.getAvailableCodecs((err, codecs) => {
+    if (err) {
+      return res.status(500).send(`Error getting FFmpeg info: ${err.message}`);
     }
-    // Send the output (which contains version info) back to the client
-    res.type('text/plain').send(stdout || stderr);
+    res.json(codecs); // Sending back all available codecs as proof
   });
 });
 
+// --- The NEW endpoint for extracting audio ---
+app.get('/extract-audio', (req, res) => {
+  // 1. Get the video URL from the query parameter
+  const videoUrl = req.query.url;
+
+  // 2. VERY IMPORTANT: Basic validation. Is there a URL?
+  if (!videoUrl) {
+    return res.status(400).send('Error: Please provide a video URL using the ?url= parameter.');
+  }
+  
+  // 3. Define a temporary path to save the output file
+  const outputPath = path.join(__dirname, `${Date.now()}-audio.m4a`);
+
+  console.log(`Starting audio extraction for: ${videoUrl}`);
+  console.log(`Output will be saved to: ${outputPath}`);
+
+  // 4. Use fluent-ffmpeg to process the video
+  ffmpeg(videoUrl)
+    .noVideo() // Tell FFmpeg to ignore the video track
+    .audioCodec('copy') // Copy the audio stream directly without re-encoding (fast!)
+    .save(outputPath) // Save the output to our temporary path
+    .on('error', (err) => {
+      // Handle errors
+      console.error(`FFmpeg error: ${err.message}`);
+      return res.status(500).send(`Error processing video: ${err.message}`);
+    })
+    .on('end', () => {
+      // Handle success
+      console.log('Extraction finished successfully.');
+      
+      // 5. Send the file to the user for download
+      res.download(outputPath, 'audio.m4a', (err) => {
+        if (err) {
+          console.error(`Error sending file: ${err.message}`);
+        }
+        
+        // 6. IMPORTANT: Clean up by deleting the temporary file from the server
+        fs.unlinkSync(outputPath);
+        console.log(`Cleaned up temporary file: ${outputPath}`);
+      });
+    });
+});
+
+
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
