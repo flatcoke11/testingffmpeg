@@ -5,7 +5,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const { Storage } = require('@google-cloud/storage');
 const axios = require('axios');
 const path = require('path');
-const fs = require('fs/promises'); // Using promise-based fs for modern async/await
+const fs = require('fs'); // Use the standard 'fs' module for all file operations
 const os = require('os'); // To get the system's temporary directory
 
 const app = express();
@@ -20,15 +20,15 @@ const upload = multer({ dest: os.tmpdir() });
 
 // Configure Google Cloud Storage
 const storage = new Storage();
-const bucketName = 'ben-ffmpeg-video-bucket-12345'; // Your bucket name is set here
+// ** VITAL STEP: Make sure this is your actual Google Cloud Storage bucket name **
+const bucketName = 'ben-ffmpeg-video-bucket-12345'; 
 
-const ensureDirExists = async (dirPath) => {
-  try {
-    await fs.mkdir(dirPath, { recursive: true });
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
+const ensureDirExists = (dirPath) => {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
   }
 };
+
 
 // =================================================================
 // === ROUTE 1: AUDIO EXTRACTION API                           ===
@@ -47,15 +47,13 @@ app.post('/extract-audio', upload.single('video'), async (req, res) => {
     try {
         await new Promise((resolve, reject) => {
             ffmpeg(tempUploadPath)
-                .noVideo()
-                .audioCodec('aac')
-                .save(tempAudioOutputPath)
+                .noVideo().audioCodec('aac').save(tempAudioOutputPath)
                 .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
                 .on('end', resolve);
         });
         
         console.log('[Audio] Extraction finished.');
-        await fs.unlink(tempUploadPath);
+        fs.unlinkSync(tempUploadPath);
 
         const gcsDestination = `audio/${outputFilename}`;
         console.log(`[Audio] Uploading ${outputFilename} to GCS bucket '${bucketName}'...`);
@@ -70,10 +68,10 @@ app.post('/extract-audio', upload.single('video'), async (req, res) => {
         res.status(200).json({ success: true, audioUrl: publicUrl });
 
     } catch (err) {
-        console.error('[Audio] Process failed:', err);
+        console.error('[Audio] Process failed:', err.message);
         res.status(500).send('Failed to process and upload audio file.');
     } finally {
-        await fs.unlink(tempAudioOutputPath).catch(e => console.error("Error cleaning up audio output:", e.message));
+        if (fs.existsSync(tempAudioOutputPath)) fs.unlinkSync(tempAudioOutputPath);
     }
 });
 
@@ -90,7 +88,7 @@ app.post('/extract-keyframes', async (req, res) => {
     }
 
     const tempDir = path.join(os.tmpdir(), `keyframes_${Date.now()}`);
-    await ensureDirExists(tempDir);
+    ensureDirExists(tempDir);
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
     try {
@@ -108,33 +106,25 @@ app.post('/extract-keyframes', async (req, res) => {
         const generatedFiles = [];
 
         shots.forEach((shot, index) => {
+            // Logic for the start frame
             const startFrameFile = `shot_${index}_start.jpg`;
-            const endFrameFile = `shot_${index}_end.jpg`;
-            generatedFiles.push(startFrameFile, endFrameFile);
-
-            // Promise for the start frame
+            generatedFiles.push(startFrameFile);
             extractionPromises.push(new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath)
-                    .seekInput(shot.startTime) // <-- CORRECTED
-                    .frames(1)
-                    .output(path.join(tempDir, startFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
                     .on('end', resolve).on('error', reject).run();
             }));
 
-            // Promise for the end frame
+            // Logic for the end frame
+            const endFrameFile = `shot_${index}_end.jpg`;
+            generatedFiles.push(endFrameFile);
             extractionPromises.push(new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath)
-                    .seekInput(shot.endTime) // <-- CORRECTED
-                    .frames(1)
-                    .output(path.join(tempDir, endFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
                     .on('end', resolve).on('error', reject).run();
             }));
         });
-
+        
         await Promise.all(extractionPromises);
         console.log(`[Keyframes] All shot boundary frames extracted.`);
-        
-        // ... (You could add the interval-based extraction here if needed)
 
         console.log(`[Keyframes] Uploading ${generatedFiles.length} files to GCS...`);
         const uploadPromises = generatedFiles.map(filename => {
@@ -151,7 +141,10 @@ app.post('/extract-keyframes', async (req, res) => {
         console.error('[Keyframes] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process keyframes.' });
     } finally {
-        await fs.rm(tempDir, { recursive: true, force: true }).catch(e => console.error("Error cleaning up temp directory:", e.message));
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+            console.log('[Keyframes] Temporary files cleaned up.');
+        }
     }
 });
 
