@@ -5,8 +5,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const { Storage } = require('@google-cloud/storage');
 const axios = require('axios');
 const path = require('path');
-const fs = require('fs'); // Using the standard 'fs' module
-const os = require('os'); // To get the system's temporary directory
+const fs = require('fs');
+const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,7 +17,7 @@ app.use(express.json());
 
 const upload = multer({ dest: os.tmpdir() });
 const storage = new Storage();
-const bucketName = 'ben-ffmpeg-video-bucket-12345'; // Your bucket name
+const bucketName = 'ben-ffmpeg-video-bucket-12345'; 
 
 const ensureDirExists = (dirPath) => {
   if (!fs.existsSync(dirPath)) {
@@ -30,40 +30,22 @@ const ensureDirExists = (dirPath) => {
 // === ROUTE 1: AUDIO EXTRACTION API                           ===
 // =================================================================
 app.post('/extract-audio', upload.single('video'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
-
+    // This endpoint remains the same
+    if (!req.file) { return res.status(400).send('No file uploaded.'); }
     const tempUploadPath = req.file.path;
     const outputFilename = `${Date.now()}-audio.m4a`;
     const tempAudioOutputPath = path.join(os.tmpdir(), outputFilename);
-
-    console.log(`[Audio] File uploaded to temp path: ${tempUploadPath}`);
-
     try {
         await new Promise((resolve, reject) => {
-            ffmpeg(tempUploadPath)
-                .noVideo().audioCodec('aac').save(tempAudioOutputPath)
+            ffmpeg(tempUploadPath).noVideo().audioCodec('aac').save(tempAudioOutputPath)
                 .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
                 .on('end', resolve);
         });
-        
-        console.log('[Audio] Extraction finished.');
         fs.unlinkSync(tempUploadPath);
-
         const gcsDestination = `audio/${outputFilename}`;
-        console.log(`[Audio] Uploading ${outputFilename} to GCS bucket '${bucketName}'...`);
-        
-        // ** THE FIX IS APPLIED HERE **
-        // The 'public: true' flag has been removed to match uniform bucket access.
-        await storage.bucket(bucketName).upload(tempAudioOutputPath, {
-            destination: gcsDestination
-        });
-        
-        console.log('[Audio] Upload to GCS successful.');
+        await storage.bucket(bucketName).upload(tempAudioOutputPath, { destination: gcsDestination });
         const publicUrl = `https://storage.googleapis.com/${bucketName}/${gcsDestination}`;
         res.status(200).json({ success: true, audioUrl: publicUrl });
-
     } catch (err) {
         console.error('[Audio] Process failed:', err.message);
         res.status(500).send('Failed to process and upload audio file.');
@@ -74,7 +56,7 @@ app.post('/extract-audio', upload.single('video'), async (req, res) => {
 
 
 // =================================================================
-// === ROUTE 2: KEYFRAME EXTRACTION API                          ===
+// === ROUTE 2: KEYFRAME EXTRACTION API (TRULY COMPLETE VERSION) ===
 // =================================================================
 app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received a request to extract keyframes.');
@@ -96,46 +78,49 @@ app.post('/extract-keyframes', async (req, res) => {
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         console.log('[Keyframes] Video downloaded successfully.');
 
-        const generatedFiles = [];
-
-        // Sequential processing for shot boundaries
+        // Task A: Extract shot boundary frames sequentially
         console.log('[Keyframes] Starting sequential extraction of shot boundary frames...');
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
             console.log(`Processing shot ${i + 1} of ${shots.length}...`);
-            const startFrameFile = `shot_${i}_start.jpg`;
-            const endFrameFile = `shot_${i}_end.jpg`;
-            
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${i}_start.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
-            generatedFiles.push(startFrameFile);
-
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${i}_end.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
-            generatedFiles.push(endFrameFile);
             console.log(`Finished processing shot ${i + 1}.`);
         }
         console.log('[Keyframes] Shot boundary frame extraction complete.');
-        
-        console.log(`[Keyframes] Uploading ${generatedFiles.length} files to GCS...`);
+
+        // --- THE MISSING STEP IS ADDED HERE ---
+        // Task B: Extract interval frames
+        console.log('[Keyframes] Starting extraction of interval frames...');
+        await new Promise((resolve, reject) => {
+            ffmpeg(localVideoPath)
+                .outputOptions('-vf', 'fps=1/2') // Set frame rate to 1 frame per 2 seconds
+                .output(path.join(tempDir, 'interval_%04d.jpg'))
+                .on('end', resolve)
+                .on('error', reject)
+                .run();
+        });
+        console.log('[Keyframes] Interval frame extraction complete.');
+        // --- END OF MISSING STEP ---
+
+        const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
+        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
+
+        // Upload all generated keyframes to GCS
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
             const gcsDestination = `keyframes/${Date.now()}_${filename}`;
-            // ** THE FIX IS APPLIED HERE **
-            // The 'public: true' flag has been removed.
             return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
         });
         const uploadResults = await Promise.all(uploadPromises);
         
-        const keyframeUrls = uploadResults.map(uploadResult => {
-            const file = uploadResult[0];
-            return `https://storage.googleapis.com/${bucketName}/${file.name}`;
-        });
-
+        const keyframeUrls = uploadResults.map(result => `https://storage.googleapis.com/${bucketName}/${result[0].name}`);
         res.status(200).json({ success: true, keyframeUrls: keyframeUrls });
 
     } catch (error) {
