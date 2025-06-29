@@ -29,39 +29,22 @@ const ensureDirExists = (dirPath) => {
 // === ROUTE 1: AUDIO EXTRACTION API                           ===
 // =================================================================
 app.post('/extract-audio', upload.single('video'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
-    }
-
+    // ... (This endpoint remains the same as before)
+    if (!req.file) { return res.status(400).send('No file uploaded.'); }
     const tempUploadPath = req.file.path;
     const outputFilename = `${Date.now()}-audio.m4a`;
     const tempAudioOutputPath = path.join(os.tmpdir(), outputFilename);
-
-    console.log(`[Audio] File uploaded to temp path: ${tempUploadPath}`);
-
     try {
         await new Promise((resolve, reject) => {
-            ffmpeg(tempUploadPath)
-                .noVideo().audioCodec('aac').save(tempAudioOutputPath)
+            ffmpeg(tempUploadPath).noVideo().audioCodec('aac').save(tempAudioOutputPath)
                 .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
                 .on('end', resolve);
         });
-        
-        console.log('[Audio] Extraction finished.');
         fs.unlinkSync(tempUploadPath);
-
         const gcsDestination = `audio/${outputFilename}`;
-        console.log(`[Audio] Uploading ${outputFilename} to GCS bucket '${bucketName}'...`);
-        
-        // The 'public: true' flag has been removed from the options object below
-        await storage.bucket(bucketName).upload(tempAudioOutputPath, {
-            destination: gcsDestination
-        });
-        
-        console.log('[Audio] Upload to GCS successful.');
+        await storage.bucket(bucketName).upload(tempAudioOutputPath, { destination: gcsDestination });
         const publicUrl = `https://storage.googleapis.com/${bucketName}/${gcsDestination}`;
         res.status(200).json({ success: true, audioUrl: publicUrl });
-
     } catch (err) {
         console.error('[Audio] Process failed:', err.message);
         res.status(500).send('Failed to process and upload audio file.');
@@ -72,7 +55,7 @@ app.post('/extract-audio', upload.single('video'), async (req, res) => {
 
 
 // =================================================================
-// === ROUTE 2: KEYFRAME EXTRACTION API                          ===
+// === ROUTE 2: KEYFRAME EXTRACTION API (COMPLETE VERSION)       ===
 // =================================================================
 app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received a request to extract keyframes.');
@@ -89,45 +72,55 @@ app.post('/extract-keyframes', async (req, res) => {
     try {
         console.log(`[Keyframes] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
-        
         const writer = fs.createWriteStream(localVideoPath);
         response.data.pipe(writer);
-        await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         console.log('[Keyframes] Video downloaded successfully.');
 
         const extractionPromises = [];
-        const generatedFiles = [];
-
+        
+        // --- LOGIC A: Extract First and Last Frame of Every Shot ---
+        console.log('[Keyframes] Preparing to extract shot boundary frames...');
         shots.forEach((shot, index) => {
-            const startFrameFile = `shot_${index}_start.jpg`;
-            generatedFiles.push(startFrameFile);
+            // Promise for the start frame
             extractionPromises.push(new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${index}_start.jpg`))
+                    .on('end', resolve).on('error', reject).run();
+            }));
+
+            // Promise for the end frame
+            extractionPromises.push(new Promise((resolve, reject) => {
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${index}_end.jpg`))
                     .on('end', resolve).on('error', reject).run();
             }));
         });
         
-        await Promise.all(extractionPromises);
-        console.log(`[Keyframes] All keyframes extracted to temp directory.`);
+        // --- LOGIC B: Extract a Frame Every 2 Seconds ---
+        console.log('[Keyframes] Preparing to extract interval frames...');
+        extractionPromises.push(new Promise((resolve, reject) => {
+            ffmpeg(localVideoPath)
+                .outputOptions('-vf', 'fps=1/2') // Set frame rate to 1 frame per 2 seconds
+                .output(path.join(tempDir, 'interval_%04d.jpg'))
+                .on('end', resolve)
+                .on('error', reject)
+                .run();
+        }));
 
-        console.log(`[Keyframes] Uploading ${generatedFiles.length} files to GCS...`);
+        await Promise.all(extractionPromises);
+        console.log('[Keyframes] All extraction tasks complete.');
+
+        const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
+        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
+
+        // Upload all generated keyframes to GCS
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
             const gcsDestination = `keyframes/${Date.now()}_${filename}`;
-            // The 'public: true' flag has been removed from the options object below
-            return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
+            return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination, public: true });
         });
         const uploadResults = await Promise.all(uploadPromises);
-        
-        const keyframeUrls = uploadResults.map(uploadResult => {
-            // Construct the public URL manually since the bucket is public
-            const file = uploadResult[0];
-            return `https://storage.googleapis.com/${bucketName}/${file.name}`;
-        });
 
+        const keyframeUrls = uploadResults.map(result => result[0].publicUrl());
         res.status(200).json({ success: true, keyframeUrls: keyframeUrls });
 
     } catch (error) {
@@ -140,6 +133,7 @@ app.post('/extract-keyframes', async (req, res) => {
         }
     }
 });
+
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
