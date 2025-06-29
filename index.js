@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');
+const multer =require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const { Storage } = require('@google-cloud/storage');
 const axios = require('axios');
@@ -25,12 +25,10 @@ const ensureDirExists = (dirPath) => {
   }
 };
 
-
 // =================================================================
 // === ROUTE 1: AUDIO EXTRACTION API                           ===
 // =================================================================
 app.post('/extract-audio', upload.single('video'), async (req, res) => {
-    // This endpoint remains the same
     if (!req.file) { return res.status(400).send('No file uploaded.'); }
     const tempUploadPath = req.file.path;
     const outputFilename = `${Date.now()}-audio.m4a`;
@@ -56,7 +54,7 @@ app.post('/extract-audio', upload.single('video'), async (req, res) => {
 
 
 // =================================================================
-// === ROUTE 2: KEYFRAME EXTRACTION API (TRULY COMPLETE VERSION) ===
+// === ROUTE 2: KEYFRAME EXTRACTION API (with new naming)      ===
 // =================================================================
 app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received a request to extract keyframes.');
@@ -82,40 +80,45 @@ app.post('/extract-keyframes', async (req, res) => {
         console.log('[Keyframes] Starting sequential extraction of shot boundary frames...');
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
-            console.log(`Processing shot ${i + 1} of ${shots.length}...`);
+            const shotNumber = i + 1;
+            console.log(`Processing shot ${shotNumber} of ${shots.length}...`);
+
+            // --- NEW NAMING LOGIC ---
+            const startTimeFormatted = shot.startTime.toFixed(2).replace('.', '-');
+            const endTimeFormatted = shot.endTime.toFixed(2).replace('.', '-');
+            const startFrameFile = `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`;
+            const endFrameFile = `shot_${shotNumber}_end_${endTimeFormatted}s.jpg`;
+            // --- END NEW NAMING LOGIC ---
+            
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${i}_start.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
                     .on('end', resolve).on('error', reject).run();
             });
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${i}_end.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
                     .on('end', resolve).on('error', reject).run();
             });
-            console.log(`Finished processing shot ${i + 1}.`);
         }
         console.log('[Keyframes] Shot boundary frame extraction complete.');
 
-        // --- THE MISSING STEP IS ADDED HERE ---
         // Task B: Extract interval frames
         console.log('[Keyframes] Starting extraction of interval frames...');
         await new Promise((resolve, reject) => {
             ffmpeg(localVideoPath)
-                .outputOptions('-vf', 'fps=1/2') // Set frame rate to 1 frame per 2 seconds
-                .output(path.join(tempDir, 'interval_%04d.jpg'))
+                .outputOptions('-vf', 'fps=1/2')
+                .output(path.join(tempDir, 'interval_frame_%04d.jpg'))
                 .on('end', resolve)
                 .on('error', reject)
                 .run();
         });
         console.log('[Keyframes] Interval frame extraction complete.');
-        // --- END OF MISSING STEP ---
 
         const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
         console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
 
-        // Upload all generated keyframes to GCS
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
-            const gcsDestination = `keyframes/${Date.now()}_${filename}`;
+            const gcsDestination = `keyframes/${filename}`; // Use the new descriptive filename
             return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
         });
         const uploadResults = await Promise.all(uploadPromises);
