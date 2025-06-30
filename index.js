@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const { Storage } = require('@google-cloud/storage');
 const axios = require('axios');
@@ -14,8 +15,9 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+const upload = multer({ dest: os.tmpdir() });
 const storage = new Storage();
-const bucketName = 'ben-ffmpeg-video-bucket-12345'; // Make sure this is your correct GCS bucket name
+const bucketName = 'ben-ffmpeg-video-bucket-12345'; 
 
 const ensureDirExists = (dirPath) => {
   if (!fs.existsSync(dirPath)) {
@@ -23,11 +25,12 @@ const ensureDirExists = (dirPath) => {
   }
 };
 
+
 // =================================================================
-// === ROUTE 1: GET MEDIA METADATA (New & Recommended First Step) ===
+// === ROUTE 1: GET MEDIA METADATA                           ===
 // =================================================================
 app.post('/get-media-metadata', async (req, res) => {
-    console.log('[Metadata] Received request.');
+    console.log('[Metadata] Received request for full media specs.');
     const { videoUrl } = req.body;
     if (!videoUrl) {
         return res.status(400).json({ error: 'Request must include "videoUrl".' });
@@ -38,37 +41,53 @@ app.post('/get-media-metadata', async (req, res) => {
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
     try {
+        console.log(`[Metadata] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
         const writer = fs.createWriteStream(localVideoPath);
         response.data.pipe(writer);
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         
-        const videoDuration = await new Promise((resolve, reject) => {
-            ffmpeg.ffprobe(localVideoPath, (err, metadata) => {
+        const metadata = await new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(localVideoPath, (err, data) => {
                 if (err) return reject(new Error(`ffprobe error: ${err.message}`));
-                resolve(metadata.format.duration);
+                resolve(data);
             });
         });
         
-        console.log(`[Metadata] Detected duration: ${videoDuration} seconds.`);
-        res.status(200).json({ success: true, detectedDuration: videoDuration });
+        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+        const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+        const result = {
+            format: {
+                duration: metadata.format.duration,
+                size_bytes: metadata.format.size,
+                bit_rate: metadata.format.bit_rate,
+            },
+            video_stream: videoStream ? { codec: videoStream.codec_name, width: videoStream.width, height: videoStream.height, avg_frame_rate: videoStream.avg_frame_rate } : null,
+            audio_stream: audioStream ? { codec: audioStream.codec_name, sample_rate: audioStream.sample_rate, channels: audioStream.channels } : null,
+        };
+        
+        console.log('[Metadata] Successfully extracted full media specs.');
+        res.status(200).json({ success: true, metadata: result });
+
     } catch (error) {
         console.error('[Metadata] Error:', error.message);
         res.status(500).json({ error: 'Failed to get media metadata.' });
     } finally {
-        if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
 
 
 // =================================================================
-// === ROUTE 2: AUDIO EXTRACTION API (Revised to use URL)      ===
+// === ROUTE 2: AUDIO EXTRACTION API (URL-based)               ===
 // =================================================================
 app.post('/extract-audio', async (req, res) => {
-    console.log('[Audio] Received request.');
+    console.log('[Audio] Received request to extract audio.');
     const { videoUrl } = req.body;
     if (!videoUrl) {
-        return res.status(400).json({ error: 'Request must include "videoUrl".' });
+        return res.status(400).json({ error: 'Request body must include "videoUrl".' });
     }
 
     const tempDir = path.join(os.tmpdir(), `audio_${Date.now()}`);
@@ -90,14 +109,18 @@ app.post('/extract-audio', async (req, res) => {
         });
         
         const gcsDestination = `audio/${Date.now()}-audio.m4a`;
-        await storage.bucket(bucketName).upload(tempAudioOutputPath, { destination: gcsDestination });
-        const publicUrl = `https://storage.googleapis.com/${bucketName}/${gcsDestination}`;
-        res.status(200).json({ success: true, audioUrl: publicUrl });
+        const [file] = await storage.bucket(bucketName).upload(tempAudioOutputPath, { destination: gcsDestination });
+        
+        console.log('[Audio] Upload to GCS successful.');
+        res.status(200).json({ success: true, audioUrl: file.publicUrl() });
+
     } catch (err) {
         console.error('[Audio] Process failed:', err.message);
-        res.status(500).send('Failed to process and upload audio file.');
+        res.status(500).send({ error: 'Failed to process and upload audio file.' });
     } finally {
-        if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
 
@@ -109,7 +132,7 @@ app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received request.');
     const { videoUrl, shots } = req.body;
     if (!videoUrl || !shots || !Array.isArray(shots)) {
-        return res.status(400).json({ error: 'Request must include "videoUrl" and a "shots" array.' });
+        return res.status(400).json({ error: 'Request body must include "videoUrl" and a "shots" array.' });
     }
 
     const tempDir = path.join(os.tmpdir(), `keyframes_${Date.now()}`);
@@ -123,18 +146,15 @@ app.post('/extract-keyframes', async (req, res) => {
         response.data.pipe(writer);
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         
-        console.log('[Keyframes] Starting sequential extraction of frames...');
+        console.log('[Keyframes] Starting sequential frame extraction...');
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
-            const shotNumber = i + 1;
-            const startTimeFormatted = shot.startTime.toFixed(2).replace('.', '-');
-            const endFrameFile = `shot_${shotNumber}_end_${shot.endTime.toFixed(2).replace('.', '-')}s.jpg`;
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${i + 1}_start_${shot.startTime.toFixed(2).replace('.', '-')}s.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${i + 1}_end_${shot.endTime.toFixed(2).replace('.', '-')}s.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
         }
@@ -143,9 +163,9 @@ app.post('/extract-keyframes', async (req, res) => {
             ffmpeg(localVideoPath).outputOptions('-vf', 'fps=1/2').output(path.join(tempDir, 'interval_frame_%04d.jpg'))
                 .on('end', resolve).on('error', reject).run();
         });
+        console.log('[Keyframes] All extraction tasks complete.');
         
         const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
-        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
             const gcsDestination = `keyframes/${filename}`;
@@ -153,13 +173,15 @@ app.post('/extract-keyframes', async (req, res) => {
         });
         const uploadResults = await Promise.all(uploadPromises);
         
-        const keyframeUrls = uploadResults.map(result => `https://storage.googleapis.com/${bucketName}/${result[0].name}`);
+        const keyframeUrls = uploadResults.map(result => result[0].publicUrl());
         res.status(200).json({ success: true, keyframeUrls: keyframeUrls });
     } catch (error) {
         console.error('[Keyframes] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process keyframes.' });
     } finally {
-        if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
 
@@ -180,7 +202,7 @@ app.post('/recombine-stems', async (req, res) => {
     const bassPath = path.join(tempDir, 'bass.wav');
     const otherPath = path.join(tempDir, 'other.wav');
     const soundscapePath = path.join(tempDir, 'soundscape.wav');
-
+    
     const downloadFile = async (url, outputPath) => {
         const writer = fs.createWriteStream(outputPath);
         const response = await axios({ method: 'get', url, responseType: 'stream' });
@@ -206,11 +228,10 @@ app.post('/recombine-stems', async (req, res) => {
         });
         
         const gcsDestination = `soundscapes/${Date.now()}-soundscape.wav`;
-        console.log(`[Recombine] Uploading to GCS...`);
         const [file] = await storage.bucket(bucketName).upload(soundscapePath, { destination: gcsDestination });
         
-        const publicUrl = file.publicUrl();
-        res.status(200).json({ success: true, soundscapeUrl: publicUrl });
+        console.log('[Recombine] Upload to GCS successful.');
+        res.status(200).json({ success: true, soundscapeUrl: file.publicUrl() });
     } catch (error) {
         console.error('[Recombine] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process audio stems.' });
@@ -220,6 +241,7 @@ app.post('/recombine-stems', async (req, res) => {
         }
     }
 });
+
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
