@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // Initialize Google Cloud Storage client
-// It will automatically use GOOGLE_APPLICATION_CREDENTIALS from your Render environment
+// This will automatically use GOOGLE_APPLICATION_CREDENTIALS from your Render environment
 const storage = new Storage();
 const bucketName = 'ben-ffmpeg-video-bucket-12345'; // Your specific bucket name
 
@@ -25,7 +25,6 @@ const ensureDirExists = (dirPath) => {
     fs.mkdirSync(dirPath, { recursive: true });
   }
 };
-
 
 // =================================================================
 // === ROUTE 1: GET MEDIA METADATA                           ===
@@ -42,6 +41,7 @@ app.post('/get-media-metadata', async (req, res) => {
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
     try {
+        console.log(`[Metadata] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
         const writer = fs.createWriteStream(localVideoPath);
         response.data.pipe(writer);
@@ -62,11 +62,13 @@ app.post('/get-media-metadata', async (req, res) => {
                 size_bytes: metadata.format.size,
                 bit_rate: metadata.format.bit_rate,
             },
-            video_stream: videoStream ? { codec: videoStream.codec_name, width: videoStream.width, height: videoStream.height, avg_frame_rate: videoStream.avg_frame_rate } : null,
-            audio_stream: audioStream ? { codec: audioStream.codec_name, sample_rate: audioStream.sample_rate, channels: audioStream.channels } : null,
+            video_stream: videoStream ? { codec: videoStream.codec_name, width: videoStream.width, height: videoStream.height, avg_frame_rate: videoStream.avg_frame_rate, nb_frames: videoStream.nb_frames } : null,
+            audio_stream: audioStream ? { codec: audioStream.codec_name, sample_rate: audioStream.sample_rate, channels: audioStream.channels, channel_layout: audioStream.channel_layout } : null,
         };
         
+        console.log('[Metadata] Successfully extracted full media specs.');
         res.status(200).json({ success: true, metadata: result });
+
     } catch (error) {
         console.error('[Metadata] Error:', error.message);
         res.status(500).json({ error: 'Failed to get media metadata.' });
@@ -124,9 +126,9 @@ app.post('/extract-audio', async (req, res) => {
 // =================================================================
 app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received request.');
-    const { videoUrl, shots, total_duration } = req.body;
-    if (!videoUrl || !shots || !Array.isArray(shots)) {
-        return res.status(400).json({ error: 'Request body must include "videoUrl" and a "shots" array.' });
+    const { videoUrl, shots, total_duration } = req.body; 
+    if (!videoUrl || !shots || !Array.isArray(shots) || !total_duration) {
+        return res.status(400).json({ error: 'Request body must include "videoUrl", "shots" array, and "total_duration".' });
     }
 
     const tempDir = path.join(os.tmpdir(), `keyframes_${Date.now()}`);
@@ -141,14 +143,20 @@ app.post('/extract-keyframes', async (req, res) => {
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         
         console.log('[Keyframes] Starting sequential frame extraction...');
-        // Task A: Extract shot boundary frames
+        
+        // Task A: Extract shot boundary frames sequentially
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
             const shotNumber = i + 1;
+            
+            // Format timestamps for filenames (e.g., 9.22s)
             const startTimeFormatted = shot.startTime.toFixed(2).replace('.', '-');
-            const endFrameFile = `shot_${shotNumber}_end_${shot.endTime.toFixed(2).replace('.', '-')}s.jpg`;
+            const endTimeFormatted = shot.endTime.toFixed(2).replace('.', '-');
+            const startFrameFile = `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`;
+            const endFrameFile = `shot_${shotNumber}_end_${endTimeFormatted}s.jpg`;
+
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
                     .on('end', resolve).on('error', reject).run();
             });
             await new Promise((resolve, reject) => {
@@ -156,21 +164,25 @@ app.post('/extract-keyframes', async (req, res) => {
                     .on('end', resolve).on('error', reject).run();
             });
         }
+        console.log('[Keyframes] Shot boundary frame extraction complete.');
         
-        // Task B: Extract interval frames
-        if (total_duration) {
-            for (let timeInSeconds = 2; timeInSeconds < total_duration; timeInSeconds += 2) {
-                const timestampFormatted = timeInSeconds.toFixed(2).padStart(7, '0').replace('.', '-');
-                const intervalFrameFile = `interval_${timestampFormatted}s.jpg`;
-                await new Promise((resolve, reject) => {
-                    ffmpeg(localVideoPath).seekInput(timeInSeconds).frames(1).output(path.join(tempDir, intervalFrameFile))
-                        .on('end', resolve).on('error', reject).run();
-                });
-            }
+        // Task B: Extract interval frames with precise timestamps
+        console.log('[Keyframes] Starting precise extraction of interval frames...');
+        for (let timeInSeconds = 2; timeInSeconds < total_duration; timeInSeconds += 2) {
+            // Format timestamps for filenames (e.g., interval_0002-00s.jpg)
+            const timestampFormatted = timeInSeconds.toFixed(2).padStart(7, '0').replace('.', '-');
+            const intervalFrameFile = `interval_${timestampFormatted}s.jpg`;
+            
+            await new Promise((resolve, reject) => {
+                ffmpeg(localVideoPath).seekInput(timeInSeconds).frames(1).output(path.join(tempDir, intervalFrameFile))
+                    .on('end', resolve).on('error', reject).run();
+            });
         }
-        console.log('[Keyframes] All extraction tasks complete.');
-        
+        console.log('[Keyframes] Precise interval frame extraction complete.');
+
         const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
+        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
+        
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
             const gcsDestination = `keyframes/${filename}`;
@@ -180,12 +192,13 @@ app.post('/extract-keyframes', async (req, res) => {
         
         const keyframeUrls = uploadResults.map(result => result[0].publicUrl());
         res.status(200).json({ success: true, keyframeUrls: keyframeUrls });
-
     } catch (error) {
         console.error('[Keyframes] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process keyframes.' });
     } finally {
-        if (fs.existsSync(tempDir)) { fs.rmSync(tempDir, { recursive: true, force: true }); }
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
 
@@ -197,7 +210,7 @@ app.post('/recombine-stems', async (req, res) => {
     console.log('[Recombine] Received request.');
     const { drumsUrl, bassUrl, otherUrl } = req.body;
     if (!drumsUrl || !bassUrl || !otherUrl) {
-        return res.status(400).json({ error: 'Request must include "drumsUrl", "bassUrl", and "otherUrl".' });
+        return res.status(400).json({ error: 'Request body must include "drumsUrl", "bassUrl", and "otherUrl".' });
     }
 
     const tempDir = path.join(os.tmpdir(), `recombine_${Date.now()}`);
@@ -236,7 +249,6 @@ app.post('/recombine-stems', async (req, res) => {
         
         console.log('[Recombine] Upload to GCS successful.');
         res.status(200).json({ success: true, soundscapeUrl: file.publicUrl() });
-
     } catch (error) {
         console.error('[Recombine] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process audio stems.' });
