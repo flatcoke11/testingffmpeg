@@ -25,13 +25,16 @@ const ensureDirExists = (dirPath) => {
   }
 };
 
+
 // =================================================================
 // === ROUTE 1: GET MEDIA METADATA                           ===
 // =================================================================
 app.post('/get-media-metadata', async (req, res) => {
     console.log('[Metadata] Received request for full media specs.');
     const { videoUrl } = req.body;
-    if (!videoUrl) { return res.status(400).json({ error: 'Request body must include "videoUrl".' }); }
+    if (!videoUrl) {
+        return res.status(400).json({ error: 'Request body must include "videoUrl".' });
+    }
 
     const tempDir = path.join(os.tmpdir(), `metadata_${Date.now()}`);
     ensureDirExists(tempDir);
@@ -58,11 +61,13 @@ app.post('/get-media-metadata', async (req, res) => {
                 size_bytes: metadata.format.size,
                 bit_rate: metadata.format.bit_rate,
             },
-            video_stream: videoStream ? { codec: videoStream.codec_name, width: videoStream.width, height: videoStream.height, avg_frame_rate: videoStream.avg_frame_rate } : null,
-            audio_stream: audioStream ? { codec: audioStream.codec_name, sample_rate: audioStream.sample_rate, channels: audioStream.channels } : null,
+            video_stream: videoStream ? { codec: videoStream.codec_name, width: videoStream.width, height: videoStream.height, avg_frame_rate: videoStream.avg_frame_rate, nb_frames: videoStream.nb_frames } : null,
+            audio_stream: audioStream ? { codec: audioStream.codec_name, sample_rate: audioStream.sample_rate, channels: audioStream.channels, channel_layout: audioStream.channel_layout } : null,
         };
         
+        console.log('[Metadata] Successfully extracted full media specs.');
         res.status(200).json({ success: true, metadata: result });
+
     } catch (error) {
         console.error('[Metadata] Error:', error.message);
         res.status(500).json({ error: 'Failed to get media metadata.' });
@@ -78,7 +83,9 @@ app.post('/get-media-metadata', async (req, res) => {
 app.post('/extract-audio', async (req, res) => {
     console.log('[Audio] Received request to extract audio.');
     const { videoUrl } = req.body;
-    if (!videoUrl) { return res.status(400).json({ error: 'Request body must include "videoUrl".' }); }
+    if (!videoUrl) {
+        return res.status(400).json({ error: 'Request body must include "videoUrl".' });
+    }
 
     const tempDir = path.join(os.tmpdir(), `audio_${Date.now()}`);
     ensureDirExists(tempDir);
@@ -86,6 +93,7 @@ app.post('/extract-audio', async (req, res) => {
     const tempAudioOutputPath = path.join(tempDir, 'audio.m4a');
 
     try {
+        console.log(`[Audio] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
         const writer = fs.createWriteStream(localVideoPath);
         response.data.pipe(writer);
@@ -100,7 +108,9 @@ app.post('/extract-audio', async (req, res) => {
         const gcsDestination = `audio/${Date.now()}-audio.m4a`;
         const [file] = await storage.bucket(bucketName).upload(tempAudioOutputPath, { destination: gcsDestination });
         
+        console.log('[Audio] Upload to GCS successful.');
         res.status(200).json({ success: true, audioUrl: file.publicUrl() });
+
     } catch (err) {
         console.error('[Audio] Process failed:', err.message);
         res.status(500).send({ error: 'Failed to process and upload audio file.' });
@@ -111,7 +121,7 @@ app.post('/extract-audio', async (req, res) => {
 
 
 // =================================================================
-// === ROUTE 3: KEYFRAME EXTRACTION API                          ===
+// === ROUTE 3: KEYFRAME EXTRACTION API (UPDATED INTERVAL)     ===
 // =================================================================
 app.post('/extract-keyframes', async (req, res) => {
     console.log('[Keyframes] Received request.');
@@ -125,51 +135,71 @@ app.post('/extract-keyframes', async (req, res) => {
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
     try {
+        console.log(`[Keyframes] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
         const writer = fs.createWriteStream(localVideoPath);
         response.data.pipe(writer);
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         
-        const generatedFiles = [];
+        console.log('[Keyframes] Starting sequential frame extraction...');
+        
+        // Task A: Extract shot boundary frames
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
             const shotNumber = i + 1;
             const startTimeFormatted = shot.startTime.toFixed(2).replace('.', '-');
-            const endFrameFile = `shot_${shotNumber}_end_${shot.endTime.toFixed(2).replace('.', '-')}s.jpg`;
-            generatedFiles.push(`shot_${shotNumber}_start_${startTimeFormatted}s.jpg`, endFrameFile);
+            const endTimeFormatted = shot.endTime.toFixed(2).replace('.', '-');
+            
             await new Promise((resolve, reject) => {
                 ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_end_${endTimeFormatted}s.jpg`))
                     .on('end', resolve).on('error', reject).run();
             });
         }
+        console.log('[Keyframes] Shot boundary frame extraction complete.');
         
-        for (let time = 2; time < total_duration; time += 2) {
-            const timestampFormatted = time.toFixed(2).padStart(7, '0').replace('.', '-');
+        // --- UPDATED LOGIC HERE ---
+        // Task B: Extract interval frames every 0.5 seconds
+        console.log('[Keyframes] Starting precise extraction of interval frames (every 0.5s)...');
+        for (let timeInSeconds = 0.5; timeInSeconds < total_duration; timeInSeconds += 0.5) {
+            const timestampFormatted = timeInSeconds.toFixed(2).padStart(7, '0').replace('.', '-');
             const intervalFrameFile = `interval_${timestampFormatted}s.jpg`;
-            generatedFiles.push(intervalFrameFile);
+            
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(time).frames(1).output(path.join(tempDir, intervalFrameFile))
-                    .on('end', resolve).on('error', reject).run();
+                ffmpeg(localVideoPath)
+                    .seekInput(timeInSeconds)
+                    .frames(1)
+                    .output(path.join(tempDir, intervalFrameFile))
+                    .on('end', resolve)
+                    .on('error', reject)
+                    .run();
             });
         }
+        console.log('[Keyframes] Precise interval frame extraction complete.');
+        // --- END OF UPDATED LOGIC ---
+
+        const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
+        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
         
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
-            return storage.bucket(bucketName).upload(localFilePath, { destination: `keyframes/${filename}` });
+            const gcsDestination = `keyframes/${filename}`;
+            return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
         });
         const uploadResults = await Promise.all(uploadPromises);
         
         const keyframeUrls = uploadResults.map(result => result[0].publicUrl());
         res.status(200).json({ success: true, keyframeUrls: keyframeUrls });
     } catch (error) {
-        console.error('[Keyframes] Error:', error.message);
+        console.error('[Keyframes] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process keyframes.' });
     } finally {
-        if (fs.existsSync(tempDir)) { fs.rmSync(tempDir, { recursive: true, force: true }); }
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
 
@@ -183,6 +213,7 @@ app.post('/recombine-stems', async (req, res) => {
     if (!drumsUrl || !bassUrl || !otherUrl) {
         return res.status(400).json({ error: 'Request body must include "drumsUrl", "bassUrl", and "otherUrl".' });
     }
+
     const tempDir = path.join(os.tmpdir(), `recombine_${Date.now()}`);
     ensureDirExists(tempDir);
     const drumsPath = path.join(tempDir, 'drums.wav');
@@ -196,99 +227,38 @@ app.post('/recombine-stems', async (req, res) => {
         response.data.pipe(writer);
         return new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
     };
+
     try {
+        console.log('[Recombine] Downloading stems...');
         await Promise.all([
             downloadFile(drumsUrl, drumsPath),
             downloadFile(bassUrl, bassPath),
             downloadFile(otherUrl, otherPath)
         ]);
+        
+        console.log('[Recombine] Mixing stems...');
         await new Promise((resolve, reject) => {
             ffmpeg().input(drumsPath).input(bassPath).input(otherPath)
                 .complexFilter('[0:a][1:a][2:a]amix=inputs=3:duration=first')
-                .on('end', resolve).on('error', (err) => reject(new Error(`FFmpeg mixdown error: ${err.message}`)))
+                .on('end', resolve)
+                .on('error', (err) => reject(new Error(`FFmpeg mixdown error: ${err.message}`)))
                 .save(soundscapePath);
         });
+        
         const gcsDestination = `soundscapes/${Date.now()}-soundscape.wav`;
         const [file] = await storage.bucket(bucketName).upload(soundscapePath, { destination: gcsDestination });
+        
+        console.log('[Recombine] Upload to GCS successful.');
         res.status(200).json({ success: true, soundscapeUrl: file.publicUrl() });
     } catch (error) {
-        console.error('[Recombine] Error:', error.message);
+        console.error('[Recombine] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process audio stems.' });
     } finally {
-        if (fs.existsSync(tempDir)) { fs.rmSync(tempDir, { recursive: true, force: true }); }
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
     }
 });
-
-
-// =================================================================
-// === ROUTE 5: EXTRACT FACE THUMBNAILS API (New)              ===
-// =================================================================
-app.post('/extract-face-thumbnails', async (req, res) => {
-    console.log('[Faces] Received request.');
-    const { videoUrl, faceAnnotations } = req.body;
-    if (!videoUrl || !faceAnnotations || !Array.isArray(faceAnnotations)) {
-        return res.status(400).json({ error: 'Request body must include "videoUrl" and "faceAnnotations" array.' });
-    }
-
-    const tempDir = path.join(os.tmpdir(), `faces_${Date.now()}`);
-    ensureDirExists(tempDir);
-    const localVideoPath = path.join(tempDir, 'source.mp4');
-
-    try {
-        const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
-        const writer = fs.createWriteStream(localVideoPath);
-        response.data.pipe(writer);
-        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-
-        const metadata = await new Promise((resolve, reject) => {
-            ffmpeg.ffprobe(localVideoPath, (err, data) => {
-                if (err) return reject(new Error(`ffprobe error: ${err.message}`));
-                resolve(data);
-            });
-        });
-        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-        if (!videoStream || !videoStream.width || !videoStream.height) {
-            throw new Error("Could not determine video dimensions.");
-        }
-        
-        const uploadPromises = [];
-        for (const face of faceAnnotations) {
-            if (!face.timeSegments || face.timeSegments.length === 0 || !face.normalizedBoundingBox) continue;
-            
-            const segment = face.timeSegments[0];
-            const timestamp = segment.startTime + ((segment.endTime - segment.startTime) / 2);
-            
-            const box = face.normalizedBoundingBox;
-            const cropWidth = Math.round((box.right - box.left) * videoStream.width);
-            const cropHeight = Math.round((box.bottom - box.top) * videoStream.height);
-            const cropX = Math.round(box.left * videoStream.width);
-            const cropY = Math.round(box.top * videoStream.height);
-
-            const outputFilename = `${face.faceId || 'face'}_at_${timestamp.toFixed(2).replace('.', '-')}s.jpg`;
-            const outputFilePath = path.join(tempDir, outputFilename);
-
-            await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(timestamp).videoFilter(`crop=${cropWidth}:${cropHeight}:${cropX}:${cropY}`).frames(1).output(outputFilePath)
-                    .on('end', resolve).on('error', reject).run();
-            });
-
-            const gcsDestination = `face_thumbnails/${outputFilename}`;
-            uploadPromises.push(storage.bucket(bucketName).upload(outputFilePath, { destination: gcsDestination }));
-        }
-
-        const uploadResults = await Promise.all(uploadPromises);
-        const thumbnailUrlUrls = uploadResults.map(result => result[0].publicUrl());
-        
-        res.status(200).json({ success: true, faceThumbnailUrls: thumbnailUrlUrls });
-
-    } catch (error) {
-        console.error('[Faces] Error:', error.message);
-        res.status(500).json({ error: 'Failed to process face thumbnails.' });
-    } finally {
-        if (fs.existsSync(tempDir)) { fs.rmSync(tempDir, { recursive: true, force: true }); }
-    }
-});
-
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
