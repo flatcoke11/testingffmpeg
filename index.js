@@ -134,6 +134,15 @@ app.post('/extract-keyframes', async (req, res) => {
     ensureDirExists(tempDir);
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
+    // --- NEW: FILENAME FORMATTING HELPER ---
+    const formatTimestampForFilename = (timeInSeconds, totalDuration) => {
+      const integerPadding = Math.floor(totalDuration).toString().length;
+      const parts = timeInSeconds.toFixed(3).split('.');
+      const seconds = parts[0].padStart(integerPadding, '0');
+      const milliseconds = parts[1];
+      return `${seconds}-${milliseconds}`;
+    };
+
     try {
         console.log(`[Keyframes] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
@@ -143,30 +152,31 @@ app.post('/extract-keyframes', async (req, res) => {
         
         console.log('[Keyframes] Starting sequential frame extraction...');
         
-        // Task A: Extract shot boundary frames
+        // --- UPDATED: Task A with new filename logic ---
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
             const shotNumber = i + 1;
-            const startTimeFormatted = shot.startTime.toFixed(2).replace('.', '-');
-            const endTimeFormatted = shot.endTime.toFixed(2).replace('.', '-');
+            const formattedStartTime = formatTimestampForFilename(shot.startTime, total_duration);
+            const formattedEndTime = formatTimestampForFilename(shot.endTime, total_duration);
+            const startFrameFile = `${formattedStartTime}_shot-${shotNumber}_start.jpg`;
+            const endFrameFile = `${formattedEndTime}_shot-${shotNumber}_end.jpg`;
             
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_start_${startTimeFormatted}s.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.startTime).frames(1).output(path.join(tempDir, startFrameFile))
                     .on('end', resolve).on('error', reject).run();
             });
             await new Promise((resolve, reject) => {
-                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, `shot_${shotNumber}_end_${endTimeFormatted}s.jpg`))
+                ffmpeg(localVideoPath).seekInput(shot.endTime).frames(1).output(path.join(tempDir, endFrameFile))
                     .on('end', resolve).on('error', reject).run();
             });
         }
         console.log('[Keyframes] Shot boundary frame extraction complete.');
         
-        // --- UPDATED LOGIC HERE ---
-        // Task B: Extract interval frames every 0.5 seconds
+        // --- UPDATED: Task B with new filename logic ---
         console.log('[Keyframes] Starting precise extraction of interval frames (every 0.5s)...');
         for (let timeInSeconds = 0.5; timeInSeconds < total_duration; timeInSeconds += 0.5) {
-            const timestampFormatted = timeInSeconds.toFixed(2).padStart(7, '0').replace('.', '-');
-            const intervalFrameFile = `interval_${timestampFormatted}s.jpg`;
+            const formattedIntervalTime = formatTimestampForFilename(timeInSeconds, total_duration);
+            const intervalFrameFile = `${formattedIntervalTime}_interval.jpg`;
             
             await new Promise((resolve, reject) => {
                 ffmpeg(localVideoPath)
@@ -179,10 +189,9 @@ app.post('/extract-keyframes', async (req, res) => {
             });
         }
         console.log('[Keyframes] Precise interval frame extraction complete.');
-        // --- END OF UPDATED LOGIC ---
 
         const generatedFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg'));
-        console.log(`[Keyframes] Found ${generatedFiles.length} keyframes to upload.`);
+        console.log(`[Keyframes] Found ${generatedFiles.length} frames to upload.`);
         
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
