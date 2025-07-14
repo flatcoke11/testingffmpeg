@@ -247,7 +247,7 @@ app.post('/recombine-stems', async (req, res) => {
         
         console.log('[Recombine] Mixing stems...');
         await new Promise((resolve, reject) => {
-            ffmpeg().input(drumsPath).input(bassPath).input(otherPath)
+            ffmpeg().input(drumsPath).input(bassPath).input(otherUrl)
                 .complexFilter('[0:a][1:a][2:a]amix=inputs=3:duration=first')
                 .on('end', resolve)
                 .on('error', (err) => reject(new Error(`FFmpeg mixdown error: ${err.message}`)))
@@ -268,6 +268,107 @@ app.post('/recombine-stems', async (req, res) => {
         }
     }
 });
+
+// =================================================================
+// === ROUTE 5: EXTRACT FACE THUMBNAILS API                    ===
+// =================================================================
+app.post('/extract-face-thumbnails', async (req, res) => {
+    console.log('[Faces] Received request to extract face thumbnails.');
+    const { videoUrl, faceAnnotations } = req.body;
+
+    if (!videoUrl || !faceAnnotations || !Array.isArray(faceAnnotations)) {
+        return res.status(400).json({ error: 'Request body must include "videoUrl" and a "faceAnnotations" array.' });
+    }
+
+    const tempDir = path.join(os.tmpdir(), `faces_${Date.now()}`);
+    ensureDirExists(tempDir);
+    const localVideoPath = path.join(tempDir, 'source.mp4');
+
+    try {
+        // 1. Download the source video file
+        console.log(`[Faces] Downloading video from: ${videoUrl}`);
+        const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
+        const writer = fs.createWriteStream(localVideoPath);
+        response.data.pipe(writer);
+        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+        console.log('[Faces] Video downloaded successfully.');
+
+        // 2. Get video dimensions with ffprobe (needed for crop calculation)
+        const metadata = await new Promise((resolve, reject) => {
+            ffmpeg.ffprobe(localVideoPath, (err, data) => {
+                if (err) return reject(new Error(`ffprobe error: ${err.message}`));
+                resolve(data);
+            });
+        });
+        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+        if (!videoStream || !videoStream.width || !videoStream.height) {
+            throw new Error("Could not determine video dimensions.");
+        }
+        const videoWidth = videoStream.width;
+        const videoHeight = videoStream.height;
+        console.log(`[Faces] Video dimensions: ${videoWidth}x${videoHeight}`);
+        
+        const generatedFiles = [];
+
+        // 3. Loop through each detected face and extract a cropped thumbnail
+        console.log(`[Faces] Starting extraction for ${faceAnnotations.length} detected face tracks...`);
+        for (const face of faceAnnotations) {
+            // Use the midpoint of the first time segment for the snapshot
+            if (!face.timeSegments || face.timeSegments.length === 0) continue;
+            const segment = face.timeSegments[0];
+            const timestamp = segment.startTime + ((segment.endTime - segment.startTime) / 2);
+
+            // The bounding box from the Google API is normalized (0.0 to 1.0)
+            // We must convert it to absolute pixel values for ffmpeg's crop filter
+            const box = face.normalizedBoundingBox;
+            const cropWidth = Math.round((box.right - box.left) * videoWidth);
+            const cropHeight = Math.round((box.bottom - box.top) * videoHeight);
+            const cropX = Math.round(box.left * videoWidth);
+            const cropY = Math.round(box.top * videoHeight);
+
+            const outputFilename = `${face.faceId}_at_${timestamp.toFixed(2)}s.jpg`;
+            const outputFilePath = path.join(tempDir, outputFilename);
+            generatedFiles.push(outputFilename);
+            
+            // Run the ffmpeg crop command
+            await new Promise((resolve, reject) => {
+                ffmpeg(localVideoPath)
+                    .seekInput(timestamp)
+                    .videoFilter(`crop=${cropWidth}:${cropHeight}:${cropX}:${cropY}`)
+                    .frames(1)
+                    .output(outputFilePath)
+                    .on('end', resolve)
+                    .on('error', reject)
+                    .run();
+            });
+        }
+        console.log('[Faces] All face thumbnails extracted.');
+
+        // 4. Upload all generated thumbnails to Google Cloud Storage
+        console.log(`[Faces] Uploading ${generatedFiles.length} files to GCS...`);
+        const uploadPromises = generatedFiles.map(filename => {
+            const localFilePath = path.join(tempDir, filename);
+            const gcsDestination = `face_thumbnails/${filename}`;
+            return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
+        });
+        const uploadResults = await Promise.all(uploadPromises);
+        
+        const thumbnailUrlUrls = uploadResults.map(result => result[0].publicUrl());
+        
+        // 5. Return the list of public URLs
+        res.status(200).json({ success: true, faceThumbnailUrls: thumbnailUrlUrls });
+
+    } catch (error) {
+        console.error('[Faces] A critical error occurred:', error.message);
+        res.status(500).json({ error: 'Failed to process face thumbnails.' });
+    } finally {
+        // 6. Clean up temporary files
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+    }
+});
+
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
