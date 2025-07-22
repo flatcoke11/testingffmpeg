@@ -17,7 +17,8 @@ app.use(express.json());
 
 const upload = multer({ dest: os.tmpdir() });
 const storage = new Storage();
-const bucketName = 'ben-ffmpeg-video-bucket-12345'; 
+// ⚠️ IMPORTANT: Replace this with your actual Google Cloud Storage bucket name
+const bucketName = 'your-gcs-bucket-name'; 
 
 const ensureDirExists = (dirPath) => {
   if (!fs.existsSync(dirPath)) {
@@ -134,7 +135,6 @@ app.post('/extract-keyframes', async (req, res) => {
     ensureDirExists(tempDir);
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
-    // --- NEW: FILENAME FORMATTING HELPER ---
     const formatTimestampForFilename = (timeInSeconds, totalDuration) => {
       const integerPadding = Math.floor(totalDuration).toString().length;
       const parts = timeInSeconds.toFixed(3).split('.');
@@ -152,7 +152,6 @@ app.post('/extract-keyframes', async (req, res) => {
         
         console.log('[Keyframes] Starting sequential frame extraction...');
         
-        // --- UPDATED: Task A with new filename logic ---
         for (let i = 0; i < shots.length; i++) {
             const shot = shots[i];
             const shotNumber = i + 1;
@@ -172,7 +171,6 @@ app.post('/extract-keyframes', async (req, res) => {
         }
         console.log('[Keyframes] Shot boundary frame extraction complete.');
         
-        // --- UPDATED: Task B with new filename logic ---
         console.log('[Keyframes] Starting precise extraction of interval frames (every 0.5s)...');
         for (let timeInSeconds = 0.5; timeInSeconds < total_duration; timeInSeconds += 0.5) {
             const formattedIntervalTime = formatTimestampForFilename(timeInSeconds, total_duration);
@@ -285,7 +283,6 @@ app.post('/extract-face-thumbnails', async (req, res) => {
     const localVideoPath = path.join(tempDir, 'source.mp4');
 
     try {
-        // 1. Download the source video file
         console.log(`[Faces] Downloading video from: ${videoUrl}`);
         const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
         const writer = fs.createWriteStream(localVideoPath);
@@ -293,7 +290,6 @@ app.post('/extract-face-thumbnails', async (req, res) => {
         await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         console.log('[Faces] Video downloaded successfully.');
 
-        // 2. Get video dimensions with ffprobe (needed for crop calculation)
         const metadata = await new Promise((resolve, reject) => {
             ffmpeg.ffprobe(localVideoPath, (err, data) => {
                 if (err) return reject(new Error(`ffprobe error: ${err.message}`));
@@ -310,16 +306,12 @@ app.post('/extract-face-thumbnails', async (req, res) => {
         
         const generatedFiles = [];
 
-        // 3. Loop through each detected face and extract a cropped thumbnail
         console.log(`[Faces] Starting extraction for ${faceAnnotations.length} detected face tracks...`);
         for (const face of faceAnnotations) {
-            // Use the midpoint of the first time segment for the snapshot
             if (!face.timeSegments || face.timeSegments.length === 0) continue;
             const segment = face.timeSegments[0];
             const timestamp = segment.startTime + ((segment.endTime - segment.startTime) / 2);
 
-            // The bounding box from the Google API is normalized (0.0 to 1.0)
-            // We must convert it to absolute pixel values for ffmpeg's crop filter
             const box = face.normalizedBoundingBox;
             const cropWidth = Math.round((box.right - box.left) * videoWidth);
             const cropHeight = Math.round((box.bottom - box.top) * videoHeight);
@@ -330,7 +322,6 @@ app.post('/extract-face-thumbnails', async (req, res) => {
             const outputFilePath = path.join(tempDir, outputFilename);
             generatedFiles.push(outputFilename);
             
-            // Run the ffmpeg crop command
             await new Promise((resolve, reject) => {
                 ffmpeg(localVideoPath)
                     .seekInput(timestamp)
@@ -344,7 +335,6 @@ app.post('/extract-face-thumbnails', async (req, res) => {
         }
         console.log('[Faces] All face thumbnails extracted.');
 
-        // 4. Upload all generated thumbnails to Google Cloud Storage
         console.log(`[Faces] Uploading ${generatedFiles.length} files to GCS...`);
         const uploadPromises = generatedFiles.map(filename => {
             const localFilePath = path.join(tempDir, filename);
@@ -355,14 +345,94 @@ app.post('/extract-face-thumbnails', async (req, res) => {
         
         const thumbnailUrlUrls = uploadResults.map(result => result[0].publicUrl());
         
-        // 5. Return the list of public URLs
         res.status(200).json({ success: true, faceThumbnailUrls: thumbnailUrlUrls });
 
     } catch (error) {
         console.error('[Faces] A critical error occurred:', error.message);
         res.status(500).json({ error: 'Failed to process face thumbnails.' });
     } finally {
-        // 6. Clean up temporary files
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+    }
+});
+
+
+// =================================================================
+// === ROUTE 6: SPLIT VIDEO BY SCENE API                         ===
+// =================================================================
+app.post('/split-by-scene', async (req, res) => {
+    console.log('[Scene Split] Received request to split video by scenes.');
+    const { videoUrl, sceneAnnotations } = req.body;
+
+    if (!videoUrl || !sceneAnnotations || !Array.isArray(sceneAnnotations)) {
+        return res.status(400).json({ error: 'Request body must include "videoUrl" and a "sceneAnnotations" array.' });
+    }
+
+    const tempDir = path.join(os.tmpdir(), `scenes_${Date.now()}`);
+    ensureDirExists(tempDir);
+    const localVideoPath = path.join(tempDir, 'source.mp4');
+
+    try {
+        console.log(`[Scene Split] Downloading video from: ${videoUrl}`);
+        const response = await axios({ method: 'get', url: videoUrl, responseType: 'stream' });
+        const writer = fs.createWriteStream(localVideoPath);
+        response.data.pipe(writer);
+        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+        console.log('[Scene Split] Video downloaded successfully.');
+
+        const generatedFiles = [];
+
+        console.log(`[Scene Split] Starting scene splitting for ${sceneAnnotations.length} scenes...`);
+        for (let i = 0; i < sceneAnnotations.length; i++) {
+            const scene = sceneAnnotations[i];
+            const startTime = scene.startTime.endsWith('s') ? scene.startTime.slice(0, -1) : scene.startTime;
+            const endTime = scene.endTime.endsWith('s') ? scene.endTime.slice(0, -1) : scene.endTime;
+            const duration = parseFloat(endTime) - parseFloat(startTime);
+
+            if (isNaN(duration) || duration <= 0) {
+                console.warn(`[Scene Split] Skipping invalid scene segment: ${JSON.stringify(scene)}`);
+                continue;
+            }
+
+            const outputFilename = `scene_${i + 1}_${startTime}s_to_${endTime}s.mp4`;
+            const outputFilePath = path.join(tempDir, outputFilename);
+            
+            await new Promise((resolve, reject) => {
+                ffmpeg(localVideoPath)
+                    .setStartTime(startTime)
+                    .setDuration(duration)
+                    .outputOptions('-c', 'copy') // Use stream copy to avoid re-encoding for speed
+                    .output(outputFilePath)
+                    .on('end', () => {
+                        generatedFiles.push(outputFilename);
+                        resolve();
+                    })
+                    .on('error', (err) => {
+                        console.error(`[Scene Split] FFmpeg error for scene ${i+1}: ${err.message}`);
+                        reject(err);
+                    })
+                    .run();
+            });
+        }
+        console.log('[Scene Split] All scene clips created.');
+
+        console.log(`[Scene Split] Uploading ${generatedFiles.length} files to GCS...`);
+        const uploadPromises = generatedFiles.map(filename => {
+            const localFilePath = path.join(tempDir, filename);
+            const gcsDestination = `scenes/${filename}`;
+            return storage.bucket(bucketName).upload(localFilePath, { destination: gcsDestination });
+        });
+        const uploadResults = await Promise.all(uploadPromises);
+
+        const sceneUrls = uploadResults.map(result => result[0].publicUrl());
+
+        res.status(200).json({ success: true, sceneUrls });
+
+    } catch (error) {
+        console.error('[Scene Split] A critical error occurred:', error.message);
+        res.status(500).json({ error: 'Failed to process video scenes.' });
+    } finally {
         if (fs.existsSync(tempDir)) {
             fs.rmSync(tempDir, { recursive: true, force: true });
         }
