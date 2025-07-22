@@ -18,7 +18,7 @@ app.use(express.json());
 const upload = multer({ dest: os.tmpdir() });
 const storage = new Storage();
 // ⚠️ IMPORTANT: Replace this with your actual Google Cloud Storage bucket name
-const bucketName = 'your-gcs-bucket-name'; 
+const bucketName = 'ben-ffmpeg-video-bucket-12345'; 
 
 const ensureDirExists = (dirPath) => {
   if (!fs.existsSync(dirPath)) {
